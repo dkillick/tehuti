@@ -20,6 +20,7 @@ import argparse
 import importlib
 import json
 import os
+import psutil
 import subprocess
 import sys
 import timeit
@@ -101,28 +102,80 @@ class PylintMetric(Metric):
         return rating
 
 
-class MemoryMetric(object):
+class Profiler(object):
+    @property
+    def scale_factor(self):
+        raise NotImplemented
+
+    def get_usage(self, pid):
+        raise NotImplemented
+
+    def interpret(self, usage_log, number, unit):
+        raise NotImplemented
+
+
+class PsutilProfiler(Profiler):
+    """
+    Determine the memory metrics of a process as specified by its pid.
+
+    The memory metrics are supplied by `psutil.Process.get_memory_info`.
+
+    """
+    def __init__(self):
+        self._scale_factor = float(2**0)
+
+    @property
+    def scale_factor(self):
+        return self._scale_factor
+
+    def get_usage(self, pid):
+        process = psutil.Process(pid)
+        usage = process.get_memory_info()[0]
+        return usage * self.scale_factor
+
+    def interpret(self, usage_log, number, unit):
+        """
+        Interpret into a common format the memory usage log from the calling
+        class that this class has populated.
+
+        """
+        return [(sum(vals) / number) / unit for vals in usage_log]
+
+
+class MemoryMetric(Metric):
     class Context(object):
         pass
 
-    def __init__(self, body, setup=None, repeat=100, number=1, name=None):
+    def __init__(self, body, setup=None, repeat=100, number=1,
+                 name=None, unit='mb'):
         self.body = body
         self.setup = setup
         self.repeat = repeat
         self.number = number
         self.name = name
+        self._unit = unit
 
-        self.pid = os.getpid()
+        self._pid = os.getpid()
         self._metrics = []
-        self._profiler_keys = ['vmpeak']
-        self._unit = 'mb'
-        self.resource_path = os.path.join('/', 'proc', str(self.pid), 'status')
+        self._profiler_keys = ['vmpeak', 'vmrss']
         self._usage_log = []
         self._scale = {'b': float(2 ** 0),
                        'kb': float(2 ** 10), 'kib': float(2 ** 10),
                        'mb': float(2 ** 20), 'mib': float(2 ** 20),
                        'gb': float(2 ** 30), 'gib': float(2 ** 30)}
-        self._profiler_scale = self._scale['kb']
+        self.profiler = PsutilProfiler()
+
+    @property
+    def unit(self):
+        return self._scale.get(self._unit, self._scale['mb'])
+
+    @property
+    def pid(self):
+        return self._pid
+
+    @pid.setter
+    def pid(self, val):
+        self._pid = val
 
     @property
     def usage_log(self):
@@ -132,28 +185,16 @@ class MemoryMetric(object):
         return 'memoryuse-{}'.format(self.name or self.body.func_name)
 
     def _outer(self, setup, func):
+        if setup != 'pass':
+            setup()
         def _inner(_func=func):
-            if setup != 'pass':
-                setup()
-            self._metrics = []
+            metrics = []
             for i in range(self.number):
                 _func()
-                self.memory_usage()
+                usage = self.profiler.get_usage(self.pid)
+                metrics.append(usage)
+            self.usage_log.append(metrics)
         return _inner
-
-    def get_usage(self):
-        with open(self.resource_path) as lines:
-            for line in lines:
-                parts = line.split()
-                metric = parts[0][:-1].lower()
-                if metric in self._profiler_keys:
-                    metric = ((float(parts[1]) * self._profiler_scale) /
-                              self._scale[self._unit])
-                    self._metrics.append(metric)
-
-    def memory_usage(self):
-        self.get_usage()
-        self.usage_log.append(self._metrics)
 
     def run(self):
         context = MemoryMetric.Context()
@@ -165,7 +206,7 @@ class MemoryMetric(object):
         runner = self._outer(setup, func)
         for i in range(self.repeat):
             runner()
-        return [sum(vals) / self.number for vals in self.usage_log]
+        return self.profiler.interpret(self.usage_log, self.number, self.unit)
 
 
 def sha(name):
